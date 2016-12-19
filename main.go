@@ -1,10 +1,9 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
@@ -12,6 +11,7 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/labstack/gommon/log"
 	"io"
+	"io/ioutil"
 	"net"
 	"strings"
 )
@@ -20,10 +20,7 @@ var configMap = map[string]struct {
 	Cmd   []string
 	Image string
 }{
-	"cpp":        {[]string{"-stream=true"}, "phluent/clang"},
-	"python":     {[]string{"-stream=true"}, "phluent/python"},
-	"javascript": {[]string{"-stream=true"}, "phluent/javascript"},
-	"typescript": {[]string{"-stream=true"}, "phluent/typescript"},
+	"cpp": {[]string{"-stream=false"}, "phluent/clang"},
 }
 
 type Problem struct {
@@ -42,19 +39,45 @@ type Payload struct {
 	Stdin    string          `json:"stdin"`
 }
 
+type PayloadResult struct {
+	Stdout string `json:"stdout"`
+	Stderr string `json:"stderr"`
+	Error  string `json:"stderr"`
+}
+
+const raw = `
+{
+  "problem": {
+    "id": ""
+  },
+  "language": "cpp",
+  "stdin": "",
+  "files": [
+    {
+      "name": "main.cpp",
+      "content": "# include <iostream>\n\nint main() {\n    std::cout << \"hello\\n\";\n    std::cout << \"hello\";\n}"
+    }
+  ]
+}
+`
+
 func main() {
 	cli, err := client.NewEnvClient()
 	if err != nil {
 		fmt.Printf("Error: %v", err)
 		return
 	}
-	raw := `{"problem":{"id":""},"language":"cpp","stdin":"","files":[{"name":"main.cpp","content":"# include <iostream>\n\nint main() {\n    std::cout << \"hello\\n\";\n    std::cout << \"hello\";\n}"}]}`
 	p := &Payload{}
 	if err := json.NewDecoder(strings.NewReader(raw)).Decode(p); err != nil {
 		fmt.Printf("Error: %v", err)
 		return
 	}
-	dockerEval(context.Background(), cli, p)
+	v, err := payloadRun(context.Background(), cli, p)
+	if err != nil {
+		fmt.Printf("Error: %v", err)
+		return
+	}
+	log.Infof("Decoded: %#v", v)
 }
 
 func writeConn(conn io.Writer, data []byte) error {
@@ -74,25 +97,7 @@ func writeConn(conn io.Writer, data []byte) error {
 	return nil
 }
 
-func writeLine(w io.Writer, text string) error {
-	n, err := w.Write([]byte(text + "\n"))
-	if n != len(text)+1 || (err != nil && err != io.EOF) {
-		errorMsg := fmt.Sprintf("Error while writing %d bytes, wrote only %d bytes. Err: %v", len(text)+1, n, err)
-		return errors.New(errorMsg)
-	}
-	return nil
-}
-
-type DockerEvalResult struct {
-	containerId string
-	Done        chan struct{}
-	Stdout      io.ReadCloser
-	Stderr      io.ReadCloser
-	Cancel      context.CancelFunc
-	Cleanup     func() error
-}
-
-func dockerEval(ctx context.Context, cli *client.Client, payload *Payload) (*DockerEvalResult, error) {
+func payloadRun(ctx context.Context, cli *client.Client, payload *Payload) (*PayloadResult, error) {
 	cfg := configMap[payload.Language]
 	config := &container.Config{
 		Image:       cfg.Image,
@@ -110,7 +115,7 @@ func dockerEval(ctx context.Context, cli *client.Client, payload *Payload) (*Doc
 
 	defer func() {
 		log.Infof("Cleaning up docker container %s", containerId)
-		//cli.ContainerRemove(context.Background(), containerId, types.ContainerRemoveOptions{Force: true})
+		cli.ContainerRemove(context.Background(), containerId, types.ContainerRemoveOptions{Force: true})
 	}()
 
 	err = cli.ContainerStart(ctx, containerId, types.ContainerStartOptions{})
@@ -146,13 +151,13 @@ func dockerEval(ctx context.Context, cli *client.Client, payload *Payload) (*Doc
 	if err != nil {
 		return nil, err
 	}
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		log.Infof("Text: %q", scanner.Text())
-		if err := scanner.Err(); err != nil {
-			log.Fatalf("scanner err: %v", err)
-			return nil, err
-		}
+	out, err := ioutil.ReadAll(stdout)
+	if err != nil {
+		return nil, err
 	}
-	return nil, nil
+	v := &PayloadResult{}
+	if err := json.NewDecoder(bytes.NewReader(out[8:])).Decode(v); err != nil {
+		return nil, err
+	}
+	return v, nil
 }
